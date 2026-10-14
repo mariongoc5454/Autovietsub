@@ -4,10 +4,26 @@ import time
 import threading
 import json
 import subprocess
+
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, 'w')
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, 'w')
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk, ImageFilter, ImageDraw
+
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    class CustomTk(ctk.CTk, TkinterDnD.DnDWrapper):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.TkdndVersion = TkinterDnD._require(self)
+    HAS_DND = True
+except ImportError:
+    CustomTk = ctk.CTk
+    HAS_DND = False
 
 # --- BẮT ĐẦU VÁ LỖI SPAM CONSOLE ---
 if os.name == 'nt':
@@ -29,6 +45,7 @@ from engines.whisper_engine import WhisperEngine
 from engines.translator_engine import TranslatorEngine
 from engines.tts_engine import TTSEngine
 from engines.render_engine import RenderEngine
+from engines.sub_detector_engine import SubDetectorEngine
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 ctk.set_appearance_mode("dark")
@@ -49,8 +66,18 @@ STYLE_MAP = {
 
 VOICE_MAP = {
     "👩 Nữ (Hoài My - Vui vẻ)": "vi-VN-HoaiMyNeural",
-    "👨 Nam (Nam Minh - Vui vẻ)": "vi-VN-NamMinhNeural"
+    "👨 Nam (Nam Minh - Vui vẻ)": "vi-VN-NamMinhNeural",
+    "🎙️ AI Clone (Giữ giọng gốc)": "ai-voice-clone"
 }
+
+voices_dir = os.path.join(BASE_PATH, "voices")
+if not os.path.exists(voices_dir):
+    os.makedirs(voices_dir, exist_ok=True)
+else:
+    for f in os.listdir(voices_dir):
+        if f.lower().endswith(('.wav', '.mp3', '.m4a')):
+            name = os.path.splitext(f)[0]
+            VOICE_MAP[f"🎙️ Clone: {name}"] = f"ai-clone:{f}"
 
 class CustomVideoCard(ctk.CTkFrame):
     def __init__(self, master, filename, variable):
@@ -98,8 +125,8 @@ class AutoSub_Enterprise_UI:
     def __init__(self, root):
         self.root = root
         self.root.title("AutoSub AI - Professional Subtitle Studio")
-        self.root.geometry("1100x850")
-        self.root.minsize(1000, 800)
+        self.root.geometry("1100x700")
+        self.root.minsize(900, 650)
         self.root.configure(fg_color="#181818")
         
         self.video_paths = []
@@ -107,6 +134,7 @@ class AutoSub_Enterprise_UI:
         self.processed_videos = set()
         self.current_processing_video = None
         
+        self.stop_event = threading.Event()
         self.original_preview_img = None
         self.active_drag_item = None
         
@@ -120,6 +148,11 @@ class AutoSub_Enterprise_UI:
         self.logo_blur_enabled = ctk.BooleanVar(value=True)
         self.logo_size_var = ctk.IntVar(value=15)
         
+        self.bg_music_enabled = ctk.BooleanVar(value=False)
+        self.bg_music_path_var = ctk.StringVar(value="")
+        self.bg_music_path = ""
+        self.bg_music_volume_var = ctk.IntVar(value=20)
+        
         self.subtitle_y_ratio = 0.85
         self.blur_y_ratio = self.subtitle_y_ratio + (self.blur_offset / 292)
         
@@ -129,9 +162,11 @@ class AutoSub_Enterprise_UI:
         self.translator = TranslatorEngine(self.dispatcher, self.cache_mgr, self.update_log)
         self.tts_engine = TTSEngine(FFMPEG_PATH, self.update_log)
         self.render_engine = RenderEngine(FFMPEG_PATH, self.update_log)
+        self.sub_detector = None
         
         self.setup_ui()
         self.load_config()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def setup_ui(self):
         self.root.grid_columnconfigure(0, weight=1)
@@ -191,6 +226,13 @@ class AutoSub_Enterprise_UI:
         
         self.scroll_frame = ctk.CTkScrollableFrame(queue_frame, fg_color="transparent")
         self.scroll_frame.pack(fill="both", expand=True, padx=10, pady=(0, 15))
+        
+        if HAS_DND:
+            queue_frame.drop_target_register(DND_FILES)
+            queue_frame.dnd_bind('<<Drop>>', self.on_drop)
+            self.scroll_frame.drop_target_register(DND_FILES)
+            self.scroll_frame.dnd_bind('<<Drop>>', self.on_drop)
+            ctk.CTkLabel(queue_frame, text="⬇️ Kéo thả video vào đây", font=("Segoe UI", 12, "italic"), text_color="#666666").pack(side="bottom", pady=(0, 10))
 
     def create_settings_panel(self, parent):
         settings_frame = ctk.CTkFrame(parent, fg_color="transparent")
@@ -204,7 +246,7 @@ class AutoSub_Enterprise_UI:
         row1.pack(fill="x", padx=20, pady=(0, 15))
         
         self.model_var = ctk.StringVar(value="gpt-4o")
-        self.combo_model = ctk.CTkComboBox(row1, values=["gpt-4o-mini", "gemini-1.5-flash", "DeepSeek-V3-0324", "gpt-4o"], variable=self.model_var, command=self.save_config, corner_radius=10, fg_color="#181818", border_width=1, border_color="#323232")
+        self.combo_model = ctk.CTkComboBox(row1, values=["gpt-4o-mini", "gemini-3.5-flash-lite", "DeepSeek-V3-0324", "gpt-4o"], variable=self.model_var, command=self.save_config, corner_radius=10, fg_color="#181818", border_width=1, border_color="#323232")
         self.combo_model.pack(side="left", fill="x", expand=True, padx=(0, 10))
         
         self.format_var = ctk.StringVar(value="💻 Máy tính (Ngang - Dàn 1 dòng)")
@@ -232,10 +274,18 @@ class AutoSub_Enterprise_UI:
         row3 = ctk.CTkFrame(card3, fg_color="transparent")
         row3.pack(fill="x", padx=20, pady=(0, 10))
         self.voice_var = ctk.StringVar(value="👩 Nữ (Hoài My - Vui vẻ)")
-        ctk.CTkComboBox(row3, values=list(VOICE_MAP.keys()), variable=self.voice_var, corner_radius=10, fg_color="#181818", border_width=1, border_color="#323232").pack(side="left", fill="x", expand=True, padx=(0, 15))
+        self.combo_voice = ctk.CTkComboBox(row3, values=list(VOICE_MAP.keys()), variable=self.voice_var, corner_radius=10, fg_color="#181818", border_width=1, border_color="#323232")
+        self.combo_voice.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        
+        self.ref_audio_path = ""
+        self.btn_select_ref = ctk.CTkButton(row3, text="🎵 Tự Chọn Giọng", command=self.select_ref_audio, width=120, fg_color="#4B5563", hover_color="#374151")
+        self.btn_select_ref.pack(side="left", padx=(0, 15))
         
         self.dub_var = ctk.BooleanVar(value=True)
-        ctk.CTkSwitch(row3, text="AI Dub", variable=self.dub_var, font=("Segoe UI", 12), progress_color="#3B82F6").pack(side="left")
+        ctk.CTkSwitch(row3, text="AI Dub", variable=self.dub_var, font=("Segoe UI", 12), progress_color="#3B82F6").pack(side="left", padx=(0, 15))
+        
+        self.mute_original_var = ctk.BooleanVar(value=False)
+        ctk.CTkSwitch(row3, text="🔇 Tắt Tiếng Video Gốc", variable=self.mute_original_var, font=("Segoe UI", 12), progress_color="#EF4444").pack(side="left")
 
         row4 = ctk.CTkFrame(card3, fg_color="transparent")
         row4.pack(fill="x", padx=20, pady=(0, 10))
@@ -250,6 +300,51 @@ class AutoSub_Enterprise_UI:
         ctk.CTkSwitch(row5, text="⭕ Blur Logo Kỳ Lân", variable=self.logo_blur_enabled, command=self.draw_blur_preview, font=("Segoe UI", 12), progress_color="#3B82F6").pack(side="left", padx=(0, 15))
         ctk.CTkLabel(row5, text="📏 Size:", font=("Segoe UI", 12), text_color="#A0A0A0").pack(side="left")
         ctk.CTkSlider(row5, from_=5, to=40, variable=self.logo_size_var, command=self.draw_blur_preview, width=150, progress_color="#FACC15").pack(side="left", padx=(5, 0))
+
+        row6 = ctk.CTkFrame(card3, fg_color="transparent")
+        row6.pack(fill="x", padx=20, pady=(0, 15))
+        ctk.CTkSwitch(row6, text="🎵 Chèn Nhạc Nền", variable=self.bg_music_enabled, font=("Segoe UI", 12), progress_color="#3B82F6").pack(side="left", padx=(0, 15))
+        self.btn_select_bg = ctk.CTkButton(row6, text="📂 Chọn Nhạc", command=self.select_bg_music, width=100, fg_color="#4B5563", hover_color="#374151")
+        self.btn_select_bg.pack(side="left", padx=(0, 15))
+        ctk.CTkLabel(row6, text="🔊 Âm lượng:", font=("Segoe UI", 12), text_color="#A0A0A0").pack(side="left")
+        ctk.CTkSlider(row6, from_=1, to=100, variable=self.bg_music_volume_var, width=120, progress_color="#FACC15").pack(side="left", padx=(5, 0))
+
+    def select_bg_music(self):
+        filepath = filedialog.askopenfilename(title="Chọn Nhạc Nền", filetypes=[("Audio Files", "*.mp3 *.wav *.m4a *.flac")])
+        if filepath:
+            self.bg_music_path = filepath
+            self.bg_music_path_var.set(filepath)
+            filename = os.path.basename(filepath)
+            if len(filename) > 15:
+                filename = filename[:12] + "..."
+            self.btn_select_bg.configure(text=f"✅ {filename}", fg_color="#10B981", hover_color="#059669")
+            self.bg_music_enabled.set(True)
+
+    def select_ref_audio(self):
+        filepath = filedialog.askopenfilename(title="Chọn file âm thanh mẫu (3-10s)", filetypes=[("Audio Files", "*.mp3 *.wav *.m4a *.flac")])
+        if filepath:
+            dialog = ctk.CTkInputDialog(text="Nhập tên để lưu lại giọng này (Để trống nếu chỉ dùng 1 lần):", title="Lưu giọng mẫu")
+            name = dialog.get_input()
+            if name:
+                import shutil
+                ext = os.path.splitext(filepath)[1]
+                new_filename = f"{name}{ext}"
+                new_path = os.path.join(BASE_PATH, "voices", new_filename)
+                try:
+                    shutil.copy(filepath, new_path)
+                    self.ref_audio_path = new_path
+                    self.btn_select_ref.configure(text=f"✅ {name}", fg_color="#10B981", hover_color="#059669")
+                    
+                    new_key = f"🎙️ Clone: {name}"
+                    VOICE_MAP[new_key] = f"ai-clone:{new_filename}"
+                    self.combo_voice.configure(values=list(VOICE_MAP.keys()))
+                    self.voice_var.set(new_key)
+                except Exception as e:
+                    self.update_log(f"Lỗi khi lưu giọng: {e}")
+            else:
+                self.ref_audio_path = filepath
+                self.btn_select_ref.configure(text="✅ Đã tải mẫu", fg_color="#10B981", hover_color="#059669")
+                self.voice_var.set("🎙️ AI Clone (Giữ giọng gốc)")
 
     def create_preview_panel(self, parent):
         self.preview_frame = ctk.CTkFrame(parent, fg_color="#222222", corner_radius=14)
@@ -298,16 +393,35 @@ class AutoSub_Enterprise_UI:
         
         self.log_box.tag_config("timestamp", foreground="#6B7280")
         self.log_box.tag_config("error", foreground="#EF4444")
+        self.log_box.tag_config("warning", foreground="#F59E0B")
         self.log_box.tag_config("success", foreground="#22C55E")
         self.log_box.tag_config("info", foreground="#E5E7EB")
 
     def create_render_panel(self, parent):
+        btn_container = ctk.CTkFrame(parent, fg_color="transparent")
+        btn_container.grid(row=2, column=0, sticky="nsew")
+        btn_container.grid_columnconfigure(0, weight=7)
+        btn_container.grid_columnconfigure(1, weight=3)
+        
         self.btn_run = ctk.CTkButton(
-            parent, text="🚀 START PROCESSING", command=self.start_process, 
+            btn_container, text="🚀 START PROCESSING", command=self.start_process, 
             font=("Segoe UI", 18, "bold"), height=60, corner_radius=14, 
             fg_color="#3B82F6", hover_color="#2563EB", state="disabled"
         )
-        self.btn_run.grid(row=2, column=0, sticky="nsew")
+        self.btn_run.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        
+        self.btn_cancel = ctk.CTkButton(
+            btn_container, text="⏹ CANCEL", command=self.cancel_process, 
+            font=("Segoe UI", 16, "bold"), height=60, corner_radius=14, 
+            fg_color="#EF4444", hover_color="#DC2626", state="disabled"
+        )
+        self.btn_cancel.grid(row=0, column=1, sticky="nsew")
+
+    def cancel_process(self):
+        if self.current_processing_video:
+            self.stop_event.set()
+            self.btn_cancel.configure(state="disabled", text="Stopping...")
+            self.update_log("🛑 Đang gửi tín hiệu hủy tác vụ, vui lòng đợi quá trình đồng bộ dừng lại...", 0)
 
     def create_statusbar(self):
         status_frame = ctk.CTkFrame(self.root, height=30, fg_color="#181818", corner_radius=0)
@@ -463,9 +577,10 @@ class AutoSub_Enterprise_UI:
             pass
 
     def load_preview(self, video_path):
+        import uuid
         def fetch_image():
+            temp_img = f"temp_preview_{uuid.uuid4().hex}.jpg"
             try:
-                temp_img = "temp_preview.jpg"
                 cmd = [FFMPEG_PATH, "-y", "-i", video_path, "-ss", "00:00:02", "-vframes", "1", "-vf", f"scale={self.canvas_width}:{self.canvas_height}:force_original_aspect_ratio=decrease", temp_img]
                 subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
                 
@@ -473,17 +588,27 @@ class AutoSub_Enterprise_UI:
                     self.root.after(0, render_image, temp_img)
             except Exception as e:
                 self.update_log(f"⚠️ Lỗi Preview: {e}")
+                if os.path.exists(temp_img):
+                    try:
+                        os.remove(temp_img)
+                    except Exception:
+                        pass
 
         def render_image(img_path):
             try:
                 original_img = Image.open(img_path)
                 self.original_preview_img = original_img.copy()
                 original_img.close()
-                os.remove(img_path)
                 
                 self.draw_blur_preview()
             except Exception:
                 pass
+            finally:
+                if os.path.exists(img_path):
+                    try:
+                        os.remove(img_path)
+                    except Exception:
+                        pass
 
         threading.Thread(target=fetch_image, daemon=True).start()
 
@@ -493,13 +618,58 @@ class AutoSub_Enterprise_UI:
                 with open("config.json", "r", encoding="utf-8") as f:
                     data = json.load(f)
                     if "model" in data: self.model_var.set(data["model"])
+                    if "format" in data: self.format_var.set(data["format"])
+                    if "style" in data: self.style_var.set(data["style"])
+                    if "font" in data: self.font_var.set(data["font"])
+                    if "voice" in data: self.voice_var.set(data["voice"])
+                    if "sub_enabled" in data: self.sub_enabled.set(data["sub_enabled"])
+                    if "dub_enabled" in data: self.dub_var.set(data["dub_enabled"])
+                    if "blur_enabled" in data: self.blur_enabled.set(data["blur_enabled"])
+                    if "blur_height" in data: self.blur_height_var.set(data["blur_height"])
+                    if "blur_strength" in data: self.blur_strength_var.set(data["blur_strength"])
+                    if "logo_blur_enabled" in data: self.logo_blur_enabled.set(data["logo_blur_enabled"])
+                    if "logo_size" in data: self.logo_size_var.set(data["logo_size"])
+                    if "sub_position" in data: self.sub_position_var.set(data["sub_position"])
+                    if "bg_music_enabled" in data: self.bg_music_enabled.set(data["bg_music_enabled"])
+                    if "bg_music_path" in data:
+                        path = data["bg_music_path"]
+                        if path and os.path.exists(path):
+                            self.bg_music_path = path
+                            self.bg_music_path_var.set(path)
+                            filename = os.path.basename(path)
+                            if len(filename) > 15: filename = filename[:12] + "..."
+                            if hasattr(self, 'btn_select_bg'):
+                                self.btn_select_bg.configure(text=f"✅ {filename}", fg_color="#10B981", hover_color="#059669")
+                    if "bg_music_volume" in data: self.bg_music_volume_var.set(data["bg_music_volume"])
         except Exception: pass
 
     def save_config(self, *args):
         try:
+            data = {
+                "model": self.model_var.get(),
+                "format": self.format_var.get(),
+                "style": self.style_var.get(),
+                "font": self.font_var.get(),
+                "voice": self.voice_var.get(),
+                "sub_enabled": self.sub_enabled.get(),
+                "dub_enabled": self.dub_var.get(),
+                "blur_enabled": self.blur_enabled.get(),
+                "blur_height": self.blur_height_var.get(),
+                "blur_strength": self.blur_strength_var.get(),
+                "logo_blur_enabled": self.logo_blur_enabled.get(),
+                "logo_size": self.logo_size_var.get(),
+                "sub_position": self.sub_position_var.get(),
+                "bg_music_enabled": self.bg_music_enabled.get(),
+                "bg_music_path": self.bg_music_path,
+                "bg_music_volume": self.bg_music_volume_var.get()
+            }
             with open("config.json", "w", encoding="utf-8") as f:
-                json.dump({"model": self.model_var.get()}, f)
+                json.dump(data, f, ensure_ascii=False, indent=4)
         except Exception: pass
+
+    def on_closing(self):
+        self.save_config()
+        self.root.destroy()
 
     def update_log(self, msg, percent=None): 
         self.root.after(0, self._update_ui, msg, percent)
@@ -511,8 +681,10 @@ class AutoSub_Enterprise_UI:
             
         self.log_box.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] ", "timestamp")
         
-        if "LỖI" in msg.upper() or "⚠️" in msg:
+        if "LỖI" in msg.upper() or "❌" in msg:
             self.log_box.insert(tk.END, f"{msg}\n", "error")
+        elif "⚠️" in msg:
+            self.log_box.insert(tk.END, f"{msg}\n", "warning")
         elif "✓" in msg or "🎉" in msg or "HOÀN TẤT" in msg:
             self.log_box.insert(tk.END, f"{msg}\n", "success")
         else:
@@ -525,27 +697,40 @@ class AutoSub_Enterprise_UI:
             chua_xu_ly = len(self.video_paths) - len(self.processed_videos)
             self.status_queue.configure(text=f"Queue: {chua_xu_ly}")
 
+    def on_drop(self, event):
+        files = self.root.tk.splitlist(event.data)
+        valid_exts = ['.mp4', '.mkv', '.mov', '.avi']
+        paths = [f for f in files if any(f.lower().endswith(ext) for ext in valid_exts)]
+        self._add_files_to_queue(paths)
+
     def add_videos(self):
         paths = filedialog.askopenfilenames(filetypes=[("Video", "*.mp4 *.mkv *.mov *.avi")])
         if paths:
-            for p in paths:
-                if p not in self.video_paths:
-                    self.video_paths.append(p)
-                    
-                    cb_var = ctk.IntVar()
-                    cb = CustomVideoCard(self.scroll_frame, filename=os.path.basename(p), variable=cb_var)
-                    cb.pack(fill="x", pady=5)
-                    self.checkbox_dict[p] = (cb, cb_var)
-                    
-            if not self.current_processing_video:
-                self.btn_run.configure(state="normal")
-                
-            chua_xu_ly = len(self.video_paths) - len(self.processed_videos)
-            self.update_log(f"📁 Đã thêm. Hàng đợi hiện có: {chua_xu_ly} video chờ.", 0)
-            self.update_status_queue()
+            self._add_files_to_queue(paths)
 
-            if len(self.video_paths) == 1:
-                self.load_preview(self.video_paths[0])
+    def _add_files_to_queue(self, paths):
+        if not paths: return
+        was_empty = len(self.video_paths) == 0
+        added_any = False
+        for p in paths:
+            if p not in self.video_paths:
+                self.video_paths.append(p)
+                
+                cb_var = ctk.IntVar()
+                cb = CustomVideoCard(self.scroll_frame, filename=os.path.basename(p), variable=cb_var)
+                cb.pack(fill="x", pady=5)
+                self.checkbox_dict[p] = (cb, cb_var)
+                added_any = True
+                
+        chua_xu_ly = len(self.video_paths) - len(self.processed_videos)
+        if not self.current_processing_video and chua_xu_ly > 0:
+            self.btn_run.configure(state="normal")
+            
+        self.update_log(f"📁 Đã thêm. Hàng đợi hiện có: {chua_xu_ly} video chờ.", 0)
+        self.update_status_queue()
+
+        if was_empty and added_any:
+            self.load_preview(self.video_paths[0])
 
     def remove_video(self):
         paths_to_remove = []
@@ -575,14 +760,16 @@ class AutoSub_Enterprise_UI:
             self.btn_run.configure(state="disabled")
 
     def start_process(self):
+        self.update_log("🚀 Đang khởi động hàng đợi xử lý...", 0)
         self.btn_run.configure(state="disabled")
-        self.processed_videos.clear()
         threading.Thread(target=self.run_pipeline, daemon=True).start()
 
     def run_pipeline(self):
         success_count = 0
+        self.stop_event.clear()
+        self.root.after(0, lambda: self.btn_cancel.configure(state="normal", text="⏹ CANCEL"))
         
-        while True:
+        while not self.stop_event.is_set():
             next_video = None
             for p in self.video_paths:
                 if p not in self.processed_videos:
@@ -609,28 +796,47 @@ class AutoSub_Enterprise_UI:
                     self.root.after(0, lambda c=cb: c.configure(text_color="#00FF00"))
                 
             except Exception as e:
-                self.update_log(f"❌ LỖI TẠI VIDEO NÀY: {str(e)}", 0)
-                self.update_log("⏭️ Bỏ qua và tự động chuyển sang video tiếp theo...", 0)
-                if next_video in self.checkbox_dict:
-                    self.root.after(0, lambda c=cb: c.configure(text_color="#FF0000"))
+                if "Tác vụ bị hủy" in str(e):
+                    self.update_log("🛑 TÁC VỤ ĐÃ BỊ HỦY BỞI NGƯỜI DÙNG.", 0)
+                    if next_video in self.checkbox_dict:
+                        self.root.after(0, lambda c=cb: c.configure(text_color="#888888"))
+                        cb.lbl_status.configure(text="⚪ Cancelled")
+                    self.processed_videos.add(next_video)
+                    self.current_processing_video = None
+                    break
+                else:
+                    self.update_log(f"❌ LỖI TẠI VIDEO NÀY: {str(e)}", 0)
+                    self.update_log("⏭️ Bỏ qua và tự động chuyển sang video tiếp theo...", 0)
+                    if next_video in self.checkbox_dict:
+                        self.root.after(0, lambda c=cb: c.configure(text_color="#FF0000"))
                     
             finally:
                 self.processed_videos.add(next_video)
                 self.current_processing_video = None
                 self.root.after(0, self.update_status_queue)
 
-        self.update_log(f"\n🎉 HOÀN TẤT! Đã xử lý thành công: {success_count} video.", 100)
+        if self.stop_event.is_set():
+            self.update_log(f"\n⏹ Đã dừng toàn bộ hàng đợi.", 0)
+        else:
+            self.update_log(f"\n🎉 HOÀN TẤT! Đã xử lý thành công: {success_count} video.", 100)
         
         chua_xu_ly = len(self.video_paths) - len(self.processed_videos)
         self.root.after(0, lambda: self.btn_run.configure(state="normal" if chua_xu_ly > 0 else "disabled"))
+        self.root.after(0, lambda: self.btn_cancel.configure(state="disabled", text="⏹ CANCEL"))
 
     def process_single_video(self, video_path):
         self.dispatcher.total_tokens_used = 0
         
-        self.update_log(f"Đang gọi Whisper Plugin (Large-v3-turbo CUDA)...", 10)
+        self.update_log(f"Đang nạp mô hình AI (có thể mất 1-2 phút lần đầu tải Whisper)...", 10)
         model = WhisperEngine.get_model()
+        if self.stop_event.is_set(): raise Exception("Tác vụ bị hủy bởi người dùng!")
+        
         segments, _ = model.transcribe(video_path, beam_size=5, vad_filter=True)
-        seg_list = list(segments)
+        seg_list = []
+        for seg in segments:
+            if self.stop_event.is_set(): raise Exception("Tác vụ bị hủy bởi người dùng!")
+            seg_list.append(seg)
+            
         total_segs = len(seg_list)
         if total_segs == 0: 
             raise Exception("Không tìm thấy âm thanh trong video này!")
@@ -646,36 +852,63 @@ class AutoSub_Enterprise_UI:
 
         translated_texts = []
         for idx, batch in enumerate(batches):
+            if self.stop_event.is_set(): raise Exception("Tác vụ bị hủy bởi người dùng!")
             self.update_log(f"Đang dịch Cụm {idx+1}/{len(batches)} (~{self.dispatcher.total_tokens_used} tokens)...", int(20 + (idx/len(batches))*40))
-            s_idx = max(0, seg_list.index(batch[0]) - 5)
+            s_idx = max(0, seg_list.index(batch[0]) - 10)
             e_idx = min(total_segs, seg_list.index(batch[-1]) + 5)
             ctx_str = " ".join([s.text for s in seg_list[s_idx:e_idx]])
             
-            results = self.translator.process_smart_batch(batch, ctx_str, self.model_var.get())
+            results = self.translator.process_smart_batch(batch, ctx_str, self.model_var.get(), self.stop_event)
             translated_texts.extend(results)
 
         dub_audio_path = None
         if self.dub_var.get():
             vid_voice = VOICE_MAP.get(self.voice_var.get())
-            dub_audio_path = self.tts_engine.generate_dubbing(seg_list, translated_texts, video_path, vid_voice, lambda m: self.update_log(m))
+            ref_audio = self.ref_audio_path if self.ref_audio_path else None
+            
+            if vid_voice and vid_voice.startswith("ai-clone:"):
+                filename = vid_voice.split(":", 1)[1]
+                ref_audio = os.path.join(BASE_PATH, "voices", filename)
+                vid_voice = "ai-voice-clone"
+                
+            dub_audio_path = self.tts_engine.generate_dubbing(seg_list, translated_texts, video_path, vid_voice, lambda m: self.update_log(m), self.stop_event, ref_audio, remove_vocals=self.mute_original_var.get())
 
         self.update_log("Đang ghép phụ đề & Render Video...", 85)
         srt_path = video_path.rsplit('.', 1)[0] + ".srt"
         is_mobile = "Điện thoại" in self.format_var.get()
         
         self.render_engine.build_srt(seg_list, translated_texts, srt_path, is_mobile)
+        if self.stop_event.is_set(): raise Exception("Tác vụ bị hủy bởi người dùng!")
         
         f_size = self.font_var.get()
         margin_v = str(int(self.sub_position_var.get()))
         f_style = f"Fontname=Arial,Fontsize={f_size},MarginV={margin_v}," + STYLE_MAP[self.style_var.get()].split("Fontname=Arial,")[1]
         
-        # Truyền thêm biến cờ bật/tắt sub_enabled xuống hệ thống render
+        blur_height_ratio = self.blur_height_var.get() / self.canvas_height
+        final_blur_y = self.blur_y_ratio
+        final_blur_h = blur_height_ratio
+        
+        if self.blur_enabled.get():
+            self.update_log("🔍 Đang dùng AI dò tìm tự động vùng phụ đề cũ...", 90)
+            if self.sub_detector is None:
+                self.sub_detector = SubDetectorEngine(self.update_log)
+            
+            ai_blur_y, ai_blur_h = self.sub_detector.detect_subtitle_region(video_path)
+            if ai_blur_y is not None and ai_blur_h is not None:
+                final_blur_y = ai_blur_y
+                final_blur_h = ai_blur_h
+                self.update_log(f"✅ AI đã tìm thấy vùng chữ ở (Y: {final_blur_y:.2f}, Height: {final_blur_h:.2f})")
+            else:
+                self.update_log("⚠️ AI không tìm thấy phụ đề, sử dụng cài đặt thủ công.")
+        
         out_vid = self.render_engine.render_video(
             video_path, srt_path, dub_audio_path, is_mobile, 
             self.blur_enabled.get(), f_style, 
-            self.blur_y_ratio, self.blur_strength_var.get(), self.blur_height_var.get(),
+            final_blur_y, self.blur_strength_var.get(), final_blur_h,
             self.logo_blur_enabled.get(), self.logo_size_var.get(),
-            self.sub_enabled.get()
+            self.sub_enabled.get(), 
+            self.bg_music_enabled.get(), self.bg_music_path, self.bg_music_volume_var.get(),
+            self.stop_event
         )
         
         self.update_log(f"✓ Video xuất thành công: {os.path.basename(out_vid)}", 95)
@@ -685,7 +918,7 @@ if __name__ == "__main__":
     try:
         import multiprocessing
         multiprocessing.freeze_support()
-        root = ctk.CTk()
+        root = CustomTk()
         app = AutoSub_Enterprise_UI(root)
         root.mainloop()
     except Exception as e:

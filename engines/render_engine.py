@@ -37,7 +37,19 @@ class RenderEngine:
                 subs.append(pysrt.SubRipItem(len(subs)+1, start=pysrt.SubRipTime(seconds=c_start), end=pysrt.SubRipTime(seconds=c_end), text=f_chunk))
         subs.save(srt_path, encoding='utf-8')
 
-    def render_video(self, video_path, srt_path, dub_audio_path, is_mobile, blur_enabled, final_style, blur_y_ratio, blur_strength, blur_height, logo_blur_enabled, logo_size_percent, sub_enabled):
+    def _run_cmd(self, cmd_args, stop_event):
+        process = subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW)
+        while True:
+            if stop_event and stop_event.is_set():
+                process.kill()
+                raise Exception("Tác vụ bị hủy bởi người dùng!")
+            try:
+                out, err = process.communicate(timeout=0.5)
+                return process.returncode, err.decode('utf-8', errors='ignore')
+            except subprocess.TimeoutExpired:
+                continue
+
+    def render_video(self, video_path, srt_path, dub_audio_path, is_mobile, blur_enabled, final_style, blur_y_ratio, blur_strength, blur_height, logo_blur_enabled, logo_size_percent, sub_enabled, bg_music_enabled, bg_music_path, bg_music_volume, stop_event=None):
         output_video = video_path.rsplit('.', 1)[0] + "_Vietsub.mp4"
         srt_escaped = srt_path.replace('\\', '/').replace(':', '\\:')
         
@@ -50,45 +62,49 @@ class RenderEngine:
         # Gọi module Blur từ file blur_engine.py
         vf_filter = BlurEngine.apply_blur(vf_filter, blur_enabled, blur_y_ratio, blur_strength, blur_height, logo_blur_enabled, logo_size_percent)
         
-        try:
+        def build_stream(args):
             in_vid = ffmpeg.input(video_path)
-            out_args = {"vcodec": "h264_nvenc", "preset": "fast"}
+            base_audio = ffmpeg.input(dub_audio_path).audio if dub_audio_path and os.path.exists(dub_audio_path) else in_vid.audio
             
-            if dub_audio_path and os.path.exists(dub_audio_path):
-                in_aud = ffmpeg.input(dub_audio_path)
-                out_args["acodec"] = "aac"
-                stream = ffmpeg.output(in_vid.video, in_aud.audio, output_video, vf=vf_filter, **out_args)
+            if bg_music_enabled and bg_music_path and os.path.exists(bg_music_path):
+                bg_audio = ffmpeg.input(bg_music_path).audio.filter('volume', bg_music_volume / 100.0)
+                # amix without normalize=0 drops volume, so we set normalize=0 if supported or just boost it.
+                # Actually, many FFmpeg versions support normalize=0. Let's try to add it.
+                mixed_audio = ffmpeg.filter([base_audio, bg_audio], 'amix', inputs=2, duration='first')
+                
+                args["acodec"] = "aac"
+                return ffmpeg.output(in_vid.video, mixed_audio, output_video, vf=vf_filter, **args)
             else:
-                out_args["acodec"] = "copy"
-                stream = ffmpeg.output(in_vid, output_video, vf=vf_filter, **out_args)
+                if dub_audio_path and os.path.exists(dub_audio_path):
+                    args["acodec"] = "aac"
+                    return ffmpeg.output(in_vid.video, base_audio, output_video, vf=vf_filter, **args)
+                else:
+                    args["acodec"] = "copy"
+                    return ffmpeg.output(in_vid, output_video, vf=vf_filter, **args)
+
+        try:
+            out_args = {"vcodec": "h264_nvenc", "preset": "fast"}
+            stream = build_stream(out_args)
             
             cmd_args = ffmpeg.compile(stream.overwrite_output(), cmd=self.ffmpeg_path)
-            result = subprocess.run(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW)
+            ret_code, err_msg = self._run_cmd(cmd_args, stop_event)
             
-            if result.returncode != 0:
-                error_msg = result.stderr.decode('utf-8', errors='ignore')
-                raise Exception(f"Lỗi GPU Render: {error_msg}")
+            if ret_code != 0:
+                raise Exception(f"Lỗi GPU Render: {err_msg}")
                 
         except Exception as e:
+            if "Tác vụ bị hủy" in str(e):
+                raise e
             self.log("⚠️ Chuyển đổi sang CPU UltraFast...")
             out_args_cpu = {"vcodec": "libx264", "preset": "ultrafast", "threads": os.cpu_count()}
+            stream = build_stream(out_args_cpu)
             
-            in_vid = ffmpeg.input(video_path)
-            if dub_audio_path and os.path.exists(dub_audio_path):
-                in_aud = ffmpeg.input(dub_audio_path)
-                out_args_cpu["acodec"] = "aac"
-                stream = ffmpeg.output(in_vid.video, in_aud.audio, output_video, vf=vf_filter, **out_args_cpu)
-            else:
-                out_args_cpu["acodec"] = "copy"
-                stream = ffmpeg.output(in_vid, output_video, vf=vf_filter, **out_args_cpu)
-                
             cmd_args_cpu = ffmpeg.compile(stream.overwrite_output(), cmd=self.ffmpeg_path)
             
-            result_cpu = subprocess.run(cmd_args_cpu, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW)
+            ret_code, err_msg = self._run_cmd(cmd_args_cpu, stop_event)
             
-            if result_cpu.returncode != 0:
-                error_msg = result_cpu.stderr.decode('utf-8', errors='ignore')
-                raise Exception(f"Lỗi hệ thống FFmpeg: {error_msg}")
+            if ret_code != 0:
+                raise Exception(f"Lỗi hệ thống FFmpeg: {err_msg}")
 
         if not os.path.exists(output_video) or os.path.getsize(output_video) == 0:
             raise Exception("Render thất bại: Tên file gốc chứa ký tự không hợp lệ hoặc FFmpeg bị sập ngầm.")

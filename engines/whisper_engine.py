@@ -7,8 +7,14 @@ os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 
 # 2. ÉP NẠP DLL VÀO HỆ THỐNG TRƯỚC KHI GỌI WHISPER
 if sys.platform == "win32":
-    cuda_bin = r"D:\AutoSub_V4\venv\Lib\site-packages\nvidia\cublas\bin"
-    cudnn_bin = r"D:\AutoSub_V4\venv\Lib\site-packages\nvidia\cudnn\bin"
+    # Hỗ trợ cả khi chạy từ mã nguồn hoặc bản build (PyInstaller)
+    if getattr(sys, 'frozen', False):
+        base_dir = sys._MEIPASS
+    else:
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        
+    cuda_bin = os.path.join(base_dir, "venv", "Lib", "site-packages", "nvidia", "cublas", "bin")
+    cudnn_bin = os.path.join(base_dir, "venv", "Lib", "site-packages", "nvidia", "cudnn", "bin")
     
     # Nhét thẳng vào biến môi trường PATH của Windows (Cách mạnh nhất)
     for path in [cuda_bin, cudnn_bin]:
@@ -52,6 +58,14 @@ class WhisperEngine:
     @classmethod
     def get_model(cls, model_name="large-v3-turbo"):
         if cls._instance is None:
-            # Ép dùng card đồ họa (cuda) + float16 để RTX 2050 chạy tối đa công suất
-            cls._instance = WhisperModel(model_name, device="cuda", compute_type="float16")
+            try:
+                # Thử nạp với float16 (nhanh nhất, chất lượng tốt nhất)
+                cls._instance = WhisperModel(model_name, device="cuda", compute_type="float16")
+            except Exception as e:
+                # Nếu thiếu VRAM, lùi xuống int8_float16 (tiết kiệm ~50% VRAM)
+                try:
+                    cls._instance = WhisperModel(model_name, device="cuda", compute_type="int8_float16")
+                except Exception as e2:
+                    # Nếu vẫn sập, chạy bằng CPU (chậm hơn nhưng bao không sập)
+                    cls._instance = WhisperModel(model_name, device="cpu", compute_type="int8")
         return cls._instance

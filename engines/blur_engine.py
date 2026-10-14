@@ -1,14 +1,18 @@
 class BlurEngine:
     @staticmethod
-    def build_blur_filter(blur_y_ratio, blur_strength, blur_height):
-        khoang_cach = blur_height / 2
+    def build_blur_filter(blur_y_ratio, blur_strength, blur_height_ratio):
+        blur_height_expr = f"(ih*{blur_height_ratio})"
+        khoang_cach = f"({blur_height_expr}/2)"
         
-        toa_do_cat_y = f"max(0\\,min(ih*{blur_y_ratio}-{khoang_cach}\\,ih-{blur_height}))"
-        toa_do_ghep_y = f"max(0\\,min(H*{blur_y_ratio}-{khoang_cach}\\,H-{blur_height}))"
+        toa_do_cat_y = f"max(0\\,min(ih*{blur_y_ratio}-{khoang_cach}\\,ih-{blur_height_expr}))"
+        
+        # Trong bộ lọc overlay, chiều cao video gốc là H, chiều cao ảnh ghép vào là h
+        # Không được dùng ih ở đây vì overlay không định nghĩa biến ih
+        toa_do_ghep_y = f"max(0\\,min(H*{blur_y_ratio}-(h/2)\\,H-h))"
         
         bo_loc_mo = (
             f"split=2[bg][blur_src];"
-            f"[blur_src]crop=w=iw:h={blur_height}:x=0:y={toa_do_cat_y},gblur=sigma={blur_strength}[blur_out];"
+            f"[blur_src]crop=w=iw:h={blur_height_expr}:x=0:y={toa_do_cat_y},gblur=sigma={blur_strength}[blur_out];"
             f"[bg][blur_out]overlay=x=0:y={toa_do_ghep_y}"
         )
         return bo_loc_mo

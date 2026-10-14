@@ -1,1 +1,18 @@
-{"model": "gpt-4o"}
+{
+    "model": "gemini-3.5-flash-lite",
+    "format": "📱 Điện thoại (Dọc - Ngắt 2 dòng)",
+    "style": "TikTok (Chữ to, Nổi bật)",
+    "font": "16",
+    "voice": "🎙️ Clone: Quang Anh",
+    "sub_enabled": false,
+    "dub_enabled": true,
+    "blur_enabled": true,
+    "blur_height": 20,
+    "blur_strength": 50,
+    "logo_blur_enabled": false,
+    "logo_size": 27,
+    "sub_position": 68.4931506849315,
+    "bg_music_enabled": false,
+    "bg_music_path": "",
+    "bg_music_volume": 18
+}

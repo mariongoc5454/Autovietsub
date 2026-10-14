@@ -18,3 +18,12 @@ api_keys.txt
 # File nhị phân kích thước lớn (>100MB sẽ bị GitHub chặn)
 ffmpeg.exe
 ffprobe.exe
+
+# Thư mục tạm & file media xuất thử
+temp/
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.srt
+*.log

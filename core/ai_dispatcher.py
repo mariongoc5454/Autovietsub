@@ -18,7 +18,7 @@ class AIDispatcher:
         chain = [(primary_provider, primary_model)]
         defaults = [
             ("gpt4omini", "gpt-4o-mini"),
-            ("gemini", "gemini-1.5-flash"),
+            ("gemini", "gemini-3.5-flash-lite"),
             ("deepseek", "DeepSeek-V3-0324"),
             ("gpt4o", "gpt-4o")
         ]
@@ -36,7 +36,13 @@ class AIDispatcher:
                         response = client.models.generate_content(model=model_name, contents=prompt)
                         text = response.text.strip()
                     else:
-                        b_url = "https://models.inference.ai.azure.com" if provider != "openai" else None
+                        if provider == "deepseek":
+                            b_url = "https://api.deepseek.com"
+                        elif provider != "openai":
+                            b_url = "https://models.inference.ai.azure.com"
+                        else:
+                            b_url = None
+                        
                         client = OpenAI(api_key=key, base_url=b_url)
                         response = client.chat.completions.create(model=model_name, messages=[{"role": "user", "content": prompt}], temperature=0.6)
                         text = response.choices[0].message.content.strip()
@@ -44,7 +50,7 @@ class AIDispatcher:
                     self.total_tokens_used += (len(prompt) + len(text)) // 4
                     return text, model_name, True
                 except Exception as e:
-                    self.log(f"⚠️ {model_name} lỗi hoặc hết Rate Limit. Chuyển đổi tự động...")
+                    self.log(f"⚠️ {model_name} lỗi: {str(e)}. Chuyển đổi tự động...")
                     continue
                     
         return "", None, False
